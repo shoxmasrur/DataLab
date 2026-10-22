@@ -10,6 +10,9 @@
     speakers/<video>/SPEAKER_00.wav                     вся речь спикера одним файлом (паузы 0.3 с)
     speakers/<video>/speakers.csv                       file, speaker, start, end, duration, overlap
     speakers/<video>/summary.json                       сколько секунд и реплик у каждого спикера
+    speakers/<video>/transcript.txt, SPEAKER_00.txt     текст по спикерам, если видео уже распознавалось
+                                                        prepare.py (берётся transcripts/<video>.voicelab.json,
+                                                        STT заново не вызывается)
 
 Наложения (два человека говорят одновременно) по умолчанию выбрасываются; --keep-overlap кладёт их
 в папку overlap/. В SQLite ничего не пишется: это просто разделение, распознавание делает prepare.py.
@@ -169,6 +172,60 @@ def join_speaker(src: Path, dst: Path, pieces: list[dict]) -> None:
                     w.writeframes(gap)
 
 
+def fmt_ts(t: float) -> str:
+    ms = int(round(t * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def speaker_at(turns: list[dict], start: float, end: float) -> str:
+    """Спикер pyannote, дольше всех говорящий на [start, end]; если никто, то ближайший по времени."""
+    best, best_ov = None, 0.0
+    for t in turns:
+        ov = min(end, t["end"]) - max(start, t["start"])
+        if ov > best_ov:
+            best, best_ov = t["speaker"], ov
+    if best is None:
+        mid = (start + end) / 2
+        best = min(turns, key=lambda t: min(abs(mid - t["start"]), abs(mid - t["end"])))["speaker"]
+    return best
+
+
+def label_transcript(stt: dict, turns: list[dict], max_gap: float = 1.0) -> list[dict]:
+    """Готовая расшифровка (кэш STT) + реплики pyannote -> [{start, end, speaker, text}].
+    Если у сегмента есть слова с таймкодами, спикер ставится каждому слову, иначе всему сегменту."""
+    units = []
+    for seg in sorted(stt.get("segments") or [], key=lambda s: s["start_ms"]):
+        words = seg.get("words") or []
+        if words:
+            units += [(w["start_ms"] / 1000, w["end_ms"] / 1000, (w.get("text") or "").strip()) for w in words]
+        elif (seg.get("text") or "").strip():
+            units.append((seg["start_ms"] / 1000, seg["end_ms"] / 1000, seg["text"].strip()))
+    lines: list[dict] = []
+    for start, end, text in units:
+        if not text:
+            continue
+        spk = speaker_at(turns, start, end)
+        last = lines[-1] if lines else None
+        if last and last["speaker"] == spk and start - last["end"] <= max_gap:
+            last["end"] = end
+            last["text"] += " " + text
+        else:
+            lines.append({"start": start, "end": end, "speaker": spk, "text": text})
+    return lines
+
+
+def write_labeled(lines: list[dict], base: Path) -> None:
+    """transcript.txt (все спикеры по времени) и SPEAKER_xx.txt (только реплики этого спикера)."""
+    fmt = [f'[{fmt_ts(x["start"])} - {fmt_ts(x["end"])}] {x["speaker"]}: {x["text"]}' for x in lines]
+    (base / "transcript.txt").write_text("\n".join(fmt) + "\n", encoding="utf-8")
+    for spk in sorted({x["speaker"] for x in lines}):
+        own = [f for f, x in zip(fmt, lines) if x["speaker"] == spk]
+        (base / f"{spk}.txt").write_text("\n".join(own) + "\n", encoding="utf-8")
+
+
 def process(src: Path, out: Path, args) -> dict | None:
     name = safe_name(src.stem)
     wav = out / "audio" / f"{name}.wav"
@@ -208,6 +265,14 @@ def process(src: Path, out: Path, args) -> dict | None:
         w = csv.DictWriter(f, fieldnames=["file", "speaker", "start", "end", "duration", "overlap"])
         w.writeheader()
         w.writerows(rows)
+
+    # Видео уже распознавалось prepare.py: подписываем готовый текст спикерами, без нового запроса к STT
+    stt_cache = out / "transcripts" / f"{name}.voicelab.json"
+    if stt_cache.exists():
+        lines = label_transcript(json.loads(stt_cache.read_text(encoding="utf-8")), turns)
+        if lines:
+            write_labeled(lines, base)
+            print(f"  текст по спикерам: {base / 'transcript.txt'}")
 
     summary = {
         "video": src.name, "duration": round(total, 1),
