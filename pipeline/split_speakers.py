@@ -10,6 +10,9 @@
     speakers/<video>/SPEAKER_00.wav                     вся речь спикера одним файлом (паузы 0.3 с)
     speakers/<video>/speakers.csv                       file, speaker, start, end, duration, overlap
     speakers/<video>/summary.json                       сколько секунд и реплик у каждого спикера
+    speakers/<video>/transcript.txt, SPEAKER_00.txt     текст по спикерам, если видео уже распознавалось
+                                                        prepare.py (берётся transcripts/<video>.voicelab.json,
+                                                        STT заново не вызывается)
 
 Наложения (два человека говорят одновременно) по умолчанию выбрасываются; --keep-overlap кладёт их
 в папку overlap/. В SQLite ничего не пишется: это просто разделение, распознавание делает prepare.py.
@@ -24,11 +27,86 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from pipeline import voicelab  # noqa: E402
-from pipeline.prepare import (MEDIA_EXT, OVERLAP_MIN, PAD, MediaError, cut_wav, get_turns,  # noqa: E402
-                              safe_name, to_wav)
+import os  # noqa: E402
+import re  # noqa: E402
+import subprocess  # noqa: E402
 
+from pipeline import diarize  # noqa: E402  (единственная зависимость внутри проекта)
+
+# Скрипт не импортирует prepare.py, чтобы работать с любой его версией.
+MEDIA_EXT = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4a", ".mp3", ".wav", ".ogg", ".flac"}
+SAMPLE_RATE = 16000
+PAD = 0.05          # запас по краям реплики, с
+OVERLAP_MIN = 0.1   # пересечение с другим спикером, после которого участок считается наложением, с
 JOIN_SILENCE = 0.3  # пауза между репликами в общем файле спикера, с
+
+
+class MediaError(RuntimeError):
+    pass
+
+
+def load_env(path: str | Path) -> None:
+    """KEY=VALUE из .env в os.environ (HF_TOKEN, DIARIZATION_DEVICE)."""
+    p = Path(path)
+    if not p.is_file():
+        return
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def safe_name(stem: str) -> str:
+    return re.sub(r"[^\w\-]+", "_", stem, flags=re.UNICODE).strip("_") or "video"
+
+
+def to_wav(src: Path, dst: Path) -> None:
+    """ffmpeg -> wav 16 kHz mono 16-bit."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", str(src), "-vn",
+                        "-ac", "1", "-ar", str(SAMPLE_RATE), "-sample_fmt", "s16", str(dst)],
+                       capture_output=True, text=True, errors="replace")
+    if r.returncode != 0:
+        dst.unlink(missing_ok=True)
+        why = " ".join(r.stderr.strip().splitlines()[-3:]) or f"код {r.returncode}"
+        raise MediaError(f"ffmpeg не смог прочитать {src.name}: {why}")
+
+
+def cut_wav(src: Path, dst: Path, start: float, end: float) -> None:
+    with wave.open(str(src), "rb") as r:
+        sr = r.getframerate()
+        r.setpos(int(start * sr))
+        frames = r.readframes(int((end - start) * sr))
+        params = r.getparams()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(dst), "wb") as w:
+        w.setparams(params)
+        w.writeframes(frames)
+
+
+def get_turns(wav: Path, cache: Path, args) -> list[dict] | None:
+    """Реплики pyannote; кэш transcripts/<video>.diarization.json (тот же, что у prepare.py)."""
+    args.diarization_error = None
+    path = cache.parent / f"{wav.stem}.diarization.json"
+    if path.exists() and not args.force:
+        return json.loads(path.read_text(encoding="utf-8"))["turns"]
+    try:
+        print(f"  pyannote: диаризация на {diarize.pick_device(args.device)} ...")
+        try:
+            turns = diarize.diarize(wav, device=args.device, num_speakers=args.num_speakers)
+        except RuntimeError as e:  # не хватило памяти видеокарты: повтор на cpu
+            if "out of memory" not in str(e).lower() or args.device == "cpu":
+                raise
+            print("  pyannote: не хватило памяти видеокарты, повтор на cpu")
+            diarize.torch_empty_cache()
+            turns = diarize.diarize(wav, device="cpu", num_speakers=args.num_speakers)
+    except Exception as e:  # noqa: BLE001
+        args.diarization_error = str(e)[:300]
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"model": diarize.MODEL, "turns": turns}, ensure_ascii=False, indent=1), encoding="utf-8")
+    return turns
 
 
 def clean_turns(turns: list[dict]) -> list[dict]:
@@ -94,6 +172,60 @@ def join_speaker(src: Path, dst: Path, pieces: list[dict]) -> None:
                     w.writeframes(gap)
 
 
+def fmt_ts(t: float) -> str:
+    ms = int(round(t * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def speaker_at(turns: list[dict], start: float, end: float) -> str:
+    """Спикер pyannote, дольше всех говорящий на [start, end]; если никто, то ближайший по времени."""
+    best, best_ov = None, 0.0
+    for t in turns:
+        ov = min(end, t["end"]) - max(start, t["start"])
+        if ov > best_ov:
+            best, best_ov = t["speaker"], ov
+    if best is None:
+        mid = (start + end) / 2
+        best = min(turns, key=lambda t: min(abs(mid - t["start"]), abs(mid - t["end"])))["speaker"]
+    return best
+
+
+def label_transcript(stt: dict, turns: list[dict], max_gap: float = 1.0) -> list[dict]:
+    """Готовая расшифровка (кэш STT) + реплики pyannote -> [{start, end, speaker, text}].
+    Если у сегмента есть слова с таймкодами, спикер ставится каждому слову, иначе всему сегменту."""
+    units = []
+    for seg in sorted(stt.get("segments") or [], key=lambda s: s["start_ms"]):
+        words = seg.get("words") or []
+        if words:
+            units += [(w["start_ms"] / 1000, w["end_ms"] / 1000, (w.get("text") or "").strip()) for w in words]
+        elif (seg.get("text") or "").strip():
+            units.append((seg["start_ms"] / 1000, seg["end_ms"] / 1000, seg["text"].strip()))
+    lines: list[dict] = []
+    for start, end, text in units:
+        if not text:
+            continue
+        spk = speaker_at(turns, start, end)
+        last = lines[-1] if lines else None
+        if last and last["speaker"] == spk and start - last["end"] <= max_gap:
+            last["end"] = end
+            last["text"] += " " + text
+        else:
+            lines.append({"start": start, "end": end, "speaker": spk, "text": text})
+    return lines
+
+
+def write_labeled(lines: list[dict], base: Path) -> None:
+    """transcript.txt (все спикеры по времени) и SPEAKER_xx.txt (только реплики этого спикера)."""
+    fmt = [f'[{fmt_ts(x["start"])} - {fmt_ts(x["end"])}] {x["speaker"]}: {x["text"]}' for x in lines]
+    (base / "transcript.txt").write_text("\n".join(fmt) + "\n", encoding="utf-8")
+    for spk in sorted({x["speaker"] for x in lines}):
+        own = [f for f, x in zip(fmt, lines) if x["speaker"] == spk]
+        (base / f"{spk}.txt").write_text("\n".join(own) + "\n", encoding="utf-8")
+
+
 def process(src: Path, out: Path, args) -> dict | None:
     name = safe_name(src.stem)
     wav = out / "audio" / f"{name}.wav"
@@ -134,6 +266,14 @@ def process(src: Path, out: Path, args) -> dict | None:
         w.writeheader()
         w.writerows(rows)
 
+    # Видео уже распознавалось prepare.py: подписываем готовый текст спикерами, без нового запроса к STT
+    stt_cache = out / "transcripts" / f"{name}.voicelab.json"
+    if stt_cache.exists():
+        lines = label_transcript(json.loads(stt_cache.read_text(encoding="utf-8")), turns)
+        if lines:
+            write_labeled(lines, base)
+            print(f"  текст по спикерам: {base / 'transcript.txt'}")
+
     summary = {
         "video": src.name, "duration": round(total, 1),
         "speakers": {spk: {"clips": len(ps), "seconds": round(sum(p["end"] - p["start"] for p in ps), 1)}
@@ -164,8 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    args.no_diarization = False
-    voicelab.load_env(args.env)
+    load_env(args.env)
     src, out = Path(args.videos), Path(args.out)
     files = [src] if src.is_file() else sorted(p for p in src.iterdir() if p.suffix.lower() in MEDIA_EXT)
     if not files:

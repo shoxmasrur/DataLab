@@ -80,7 +80,8 @@ python -m pipeline.split_speakers --videos film.mp4         # один файл
 
 Работает только pyannote (нужны `HF_TOKEN` и `requirements-diarization.txt`). Результат в `data/speakers/<video>/`:
 папки `SPEAKER_00/`, `SPEAKER_01/` с репликами 1.5–15 с, `SPEAKER_00.wav` (вся речь спикера одним файлом),
-`speakers.csv` (таймкоды) и `summary.json` (секунды на спикера). Участки, где говорят одновременно, вырезаются
+`speakers.csv` (таймкоды) и `summary.json` (секунды на спикера). Если видео уже распознавалось `prepare.py`,
+готовый текст из `transcripts/<video>.voicelab.json` подписывается спикерами: `transcript.txt` и `SPEAKER_00.txt` (STT заново не вызывается). Участки, где говорят одновременно, вырезаются
 из реплик; `--keep-overlap` сохраняет их в `overlap/`. Кэш диаризации общий с `prepare.py`, поэтому потом
 `prepare` не будет диаризовать то же видео заново. Флаги: `--device`, `--min-dur`, `--max-dur`, `--max-gap`, `--force`.
 
