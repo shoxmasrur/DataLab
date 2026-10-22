@@ -69,6 +69,21 @@ python -m pipeline.prepare           # или пакетно: видео из da
 `--keep-overlap` (оставить наложения со статусом `overlap`), `--no-speakers` (только voicelab),
 `--upload-format wav|flac|mp3` (только voicelab; если большой файл не принимается, попробуйте `mp3`), `--force`, `--allow-duplicates`.
 
+### Только разделить спикеров (без STT)
+
+Если нужно просто разделить людей в видео, без распознавания текста, ключей API и кредитов:
+
+```bash
+python -m pipeline.split_speakers --num-speakers 2          # все видео из data/videos/
+python -m pipeline.split_speakers --videos film.mp4         # один файл
+```
+
+Работает только pyannote (нужны `HF_TOKEN` и `requirements-diarization.txt`). Результат в `data/speakers/<video>/`:
+папки `SPEAKER_00/`, `SPEAKER_01/` с репликами 1.5–15 с, `SPEAKER_00.wav` (вся речь спикера одним файлом),
+`speakers.csv` (таймкоды) и `summary.json` (секунды на спикера). Участки, где говорят одновременно, вырезаются
+из реплик; `--keep-overlap` сохраняет их в `overlap/`. Кэш диаризации общий с `prepare.py`, поэтому потом
+`prepare` не будет диаризовать то же видео заново. Флаги: `--device`, `--min-dur`, `--max-dur`, `--max-gap`, `--force`.
+
 Результат STT кэшируется в `transcripts/<video>.voicelab.json` (имя историческое, поле `provider` говорит, кто его
 сделал), поэтому повторный запуск не отправляет видео заново (кроме `--force`).
 
